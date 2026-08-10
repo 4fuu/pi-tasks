@@ -10,7 +10,7 @@ const tasks = registerTaskReporter(pi, "python");
 tasks.publishCatalog(sessionId, currentTasks);
 ```
 
-The package is installed transitively by task source plugins; users normally do not install or configure it directly. Run `/tasks` in interactive mode for a read-only, scrollable snapshot containing active and recent terminal tasks.
+The package is installed transitively by task source plugins; users normally do not install or configure it directly. Run `/tasks` in interactive mode for a read-only, scrollable snapshot containing active and recent terminal tasks. The compact widget suppresses short-lived work: a task appears only after running for five seconds, then remains visible in its terminal state for at least five seconds before leaving the panel.
 
 All task plugins must be upgraded together when migrating from older task packages. Mixed generations cannot coordinate their legacy widgets/commands with this channel.
 

@@ -11,6 +11,8 @@ export interface TaskTimingOptions { heartbeatMs?: number; participantStaleMs?: 
 export interface TaskReporter { publishCatalog(sessionId: string, tasks: readonly PresentedTask[]): void; close(): void }
 
 const CAP = 100;
+const WIDGET_REVEAL_MS = 5_000;
+const WIDGET_LINGER_MS = 5_000;
 type Wire =
   | { v: 1; type: "probe"; sessionId: string; token: string }
   | { v: 1; type: "owner"; token: string; participantId: string }
@@ -19,6 +21,7 @@ type Wire =
   | { v: 1; type: "leave"; sessionId: string; participantId: string };
 interface Catalog { sessionId: string; participantId: string; source: TaskSource; observedAt: number; tasks: PresentedTask[]; omittedActive: number; omittedTerminal: number }
 interface Aggregate { tasks: PresentedTask[]; activeTotal: number; omitted: number }
+interface WidgetRecord { task: PresentedTask; revealed: boolean; terminalAt?: number }
 
 const source = (v: unknown): v is TaskSource => v === "python" || v === "pwsh" || v === "subagent";
 const phase = (v: unknown): v is TaskPhase => v === "active" || v === "completed" || v === "failed" || v === "cancelled";
@@ -51,11 +54,11 @@ class TasksWidget implements Component {
   constructor(private state: Aggregate, private readonly theme: Theme) {}
   setState(s: Aggregate): void { this.state = s; }
   render(width: number): string[] {
-    if (width <= 0 || this.state.activeTotal === 0) return []; const active = this.state.tasks.filter(t => t.phase === "active").sort(compare).slice(0, 3);
+    if (width <= 0 || this.state.tasks.length === 0) return []; const visible = this.state.tasks.slice(0, 3);
     const left = this.theme.fg("accent", this.theme.bold(`Tasks · ${this.state.activeTotal} active`)); const hint = this.theme.fg("dim", "Run /tasks for details");
     const gap = width - visibleWidth(left) - visibleWidth(hint); const out = [truncateToWidth(gap > 0 ? `${left}${" ".repeat(gap)}${hint}` : left, width)];
-    for (const t of active) { out.push(truncateToWidth(`${this.theme.fg("accent", `#${t.taskId}`)} ${t.source} · ${t.statusLabel}`, width)); const detail = t.summary || t.meta; if (detail) out.push(truncateToWidth(`   ${this.theme.fg("muted", "↳")} ${detail}`, width)); }
-    const hidden = this.state.activeTotal - active.length; if (hidden > 0) out.push(truncateToWidth(this.theme.fg("dim", `… ${hidden} more`), width)); return out;
+    for (const t of visible) { out.push(truncateToWidth(`${this.theme.fg("accent", `#${t.taskId}`)} ${t.source} · ${t.statusLabel}`, width)); const detail = t.summary || t.meta; if (detail) out.push(truncateToWidth(`   ${this.theme.fg("muted", "↳")} ${detail}`, width)); }
+    const hidden = this.state.tasks.length - visible.length; if (hidden > 0) out.push(truncateToWidth(this.theme.fg("dim", `… ${hidden} more`), width)); return out;
   }
   invalidate(): void {}
 }
@@ -72,9 +75,13 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
   const id = randomUUID(), heartbeatMs = options.heartbeatMs ?? 1000, participantStaleMs = options.participantStaleMs ?? 3500, catalogStaleMs = options.catalogStaleMs ?? 3500, now = options.now ?? Date.now;
   let eligible = false, owner = false, command = false, closed = false, mounted = false, sessionId: string | undefined, timer: NodeJS.Timeout | undefined, local: Catalog | undefined, widget: TasksWidget | undefined, tui: TUI | undefined, widgetContext: ExtensionContext | undefined, renderSignature: string | undefined;
   const participants = new Map<string, { sessionId: string; seenAt: number }>(), catalogs = new Map<string, Catalog>();
+  const widgetRecords = new Map<string, WidgetRecord>();
   const emit = (e: Wire) => pi.events.emit(TASKS_CHANNEL, e);
   function aggregate(): Aggregate { const n = now(); const best = new Map<string, PresentedTask>(); let omitted = 0, omittedActive = 0; for (const c of catalogs.values()) { if (c.sessionId !== sessionId || n - c.observedAt > catalogStaleMs) continue; omitted += c.omittedActive + c.omittedTerminal; omittedActive += c.omittedActive; for (const t of c.tasks) { const old = best.get(t.taskKey); if (!old || t.updatedAt > old.updatedAt || (t.updatedAt === old.updatedAt && `${t.source}:${t.taskId}` > `${old.source}:${old.taskId}`)) best.set(t.taskKey, t); } } const tasks = [...best.values()].sort((a,b) => a.phase === "active" && b.phase !== "active" ? -1 : a.phase !== "active" && b.phase === "active" ? 1 : compare(a,b)); return { tasks, activeTotal: tasks.filter(t => t.phase === "active").length + omittedActive, omitted }; }
-  function render(): void { if (!owner || !widget || !tui) return; const next = aggregate(); const signature = JSON.stringify(next); if (signature === renderSignature) return; renderSignature = signature; widget.setState(next); tui.requestRender(); }
+  function widgetState(): Aggregate { const n = now(); const current = new Map(aggregate().tasks.map(t => [t.taskKey, t])); for (const task of current.values()) { const record = widgetRecords.get(task.taskKey); const startedAt = task.startedAt ?? task.createdAt; if (task.phase === "active") { if (record) { record.task = task; record.terminalAt = undefined; if (!record.revealed && n - startedAt >= WIDGET_REVEAL_MS) record.revealed = true; } else widgetRecords.set(task.taskKey, { task, revealed: n - startedAt >= WIDGET_REVEAL_MS }); continue; } if (!record) continue; if (!record.revealed) { const endedAt = task.endedAt ?? task.updatedAt; if (endedAt - startedAt < WIDGET_REVEAL_MS) { widgetRecords.delete(task.taskKey); continue; } record.revealed = true; } record.task = task; record.terminalAt ??= n; }
+    for (const [taskKey, record] of widgetRecords) { if (record.terminalAt !== undefined) { if (n - record.terminalAt >= WIDGET_LINGER_MS) widgetRecords.delete(taskKey); } else if (!current.has(taskKey)) widgetRecords.delete(taskKey); }
+    const tasks = [...widgetRecords.values()].filter(record => record.revealed).map(record => record.task).sort(compare); return { tasks, activeTotal: tasks.filter(task => task.phase === "active").length, omitted: 0 }; }
+  function render(): void { if (!owner || !widget || !tui) return; const next = widgetState(); const signature = JSON.stringify(next); if (signature === renderSignature) return; renderSignature = signature; widget.setState(next); tui.requestRender(); }
   function announce(replay = true): void { if (!eligible || !sessionId) return; emit({ v: 1, type: "participant", sessionId, participantId: id, source: reporterSource, seenAt: now() }); if (replay && local) emit({ v: 1, type: "catalog", ...local }); }
   const unsubscribe = pi.events.on(TASKS_CHANNEL, raw => { const e = wire(raw); if (!e) return; if (e.type === "probe") { if (owner && eligible && e.sessionId === sessionId) emit({ v: 1, type: "owner", token: e.token, participantId: id }); if (eligible && e.sessionId === sessionId) announce(); return; } if (e.type === "participant") participants.set(e.participantId, { sessionId: e.sessionId, seenAt: now() }); else if (e.type === "leave") { participants.delete(e.participantId); catalogs.delete(e.participantId); } else if (e.type === "catalog") catalogs.set(e.participantId, e); render(); });
   pi.on("session_start", (_event, ctx) => {
@@ -83,10 +90,10 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
     const off = pi.events.on(TASKS_CHANNEL, raw => { const e = wire(raw); if (e?.type === "owner" && e.token === token) acknowledged = true; }); emit({ v: 1, type: "probe", sessionId, token }); off();
     if (!acknowledged && !owner) { owner = true; emit({ v: 1, type: "owner", token, participantId: id }); }
     if (owner && !command) { command = true; pi.registerCommand("tasks", { description: "Show all background tasks", handler: async (_args, commandCtx) => { if (commandCtx.mode !== "tui") return commandCtx.ui.notify("/tasks requires interactive mode", "error"); const snap = aggregate(); const copy: Aggregate = { ...snap, tasks: snap.tasks.map(cloneTask) }; await commandCtx.ui.custom<void>((viewTui, theme, _keys, done) => new TasksViewer(copy, viewTui, theme, done)); } }); }
-    if (owner && ctx.mode === "tui") { mounted = true; widgetContext = ctx; ctx.ui.setWidget(TASKS_WIDGET_KEY, (newTui, theme) => { tui = newTui; const initial = aggregate(); renderSignature = JSON.stringify(initial); widget = new TasksWidget(initial, theme); return widget; }, { placement: "aboveEditor" }); }
+    if (owner && ctx.mode === "tui") { mounted = true; widgetContext = ctx; ctx.ui.setWidget(TASKS_WIDGET_KEY, (newTui, theme) => { tui = newTui; const initial = widgetState(); renderSignature = JSON.stringify(initial); widget = new TasksWidget(initial, theme); return widget; }, { placement: "aboveEditor" }); }
     announce(); if (heartbeatMs > 0 && !timer) { timer = setInterval(() => { announce(); const n = now(); for (const [key,p] of participants) if (n-p.seenAt > participantStaleMs) { participants.delete(key); catalogs.delete(key); } render(); }, heartbeatMs); timer.unref?.(); }
   });
-  function shutdown(ctx?: ExtensionContext): void { if (sessionId) emit({ v: 1, type: "leave", sessionId, participantId: id }); eligible = false; if (timer) clearInterval(timer); timer = undefined; local = undefined; participants.clear(); catalogs.clear(); if (owner && mounted) (ctx ?? widgetContext)?.ui.setWidget(TASKS_WIDGET_KEY, undefined); mounted = false; widget = undefined; tui = undefined; widgetContext = undefined; renderSignature = undefined; sessionId = undefined; }
+  function shutdown(ctx?: ExtensionContext): void { if (sessionId) emit({ v: 1, type: "leave", sessionId, participantId: id }); eligible = false; if (timer) clearInterval(timer); timer = undefined; local = undefined; participants.clear(); catalogs.clear(); widgetRecords.clear(); if (owner && mounted) (ctx ?? widgetContext)?.ui.setWidget(TASKS_WIDGET_KEY, undefined); mounted = false; widget = undefined; tui = undefined; widgetContext = undefined; renderSignature = undefined; sessionId = undefined; }
   pi.on("session_shutdown", (_event, ctx) => shutdown(ctx));
   return { publishCatalog(sid, input) { if (closed || !sessionId || sid !== sessionId) return; const normalized = input.flatMap(v => { const t = task(v, reporterSource); return t ? [t] : []; }); const active = normalized.filter(t => t.phase === "active").sort(compare); const terminal = normalized.filter(t => t.phase !== "active").sort((a,b) => b.updatedAt-a.updatedAt || compare(a,b)); const kept = [...active.slice(0,CAP), ...terminal.slice(0, Math.max(0,CAP-active.length))]; local = { sessionId, participantId: id, source: reporterSource, observedAt: now(), tasks: kept, omittedActive: Math.max(0,active.length-CAP), omittedTerminal: Math.max(0, terminal.length-Math.max(0,CAP-active.length)) }; emit({ v: 1, type: "catalog", ...local }); }, close() { if (closed) return; closed = true; shutdown(); unsubscribe(); } };
 }

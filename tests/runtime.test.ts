@@ -63,6 +63,42 @@ test("late mismatched publish is ignored and updates do not remount", async () =
   assert.equal(x.widgets.length, mounted); assert.ok(x.renders >= 2); reporter.close();
 });
 
+test("the widget reveals long tasks after five seconds and lingers terminal state for five seconds", async () => {
+  let now = 1_000;
+  const bus = new Bus(), x = fake(bus); const reporter = registerTaskReporter(x.api, "python", { heartbeatMs: 0, now: () => now });
+  await x.fire("session_start"); const mounted = x.widgets.length;
+  const running: PresentedTask = { taskKey: "python:slow", source: "python", taskId: "slow", phase: "active", statusLabel: "running", createdAt: now, updatedAt: now };
+  reporter.publishCatalog("s", [running]);
+  assert.deepEqual(x.component?.render(60), []);
+  now += 4_999; reporter.publishCatalog("s", [running]);
+  assert.deepEqual(x.component?.render(60), []);
+  now += 1; reporter.publishCatalog("s", [running]);
+  assert.match(x.component?.render(60)[0] ?? "", /^Tasks · 1 active/);
+
+  now += 100;
+  const completed: PresentedTask = { ...running, phase: "completed", statusLabel: "completed", updatedAt: now, endedAt: now };
+  reporter.publishCatalog("s", [completed]);
+  assert.match(x.component?.render(60).join("\n") ?? "", /Tasks · 0 active[\s\S]*completed/);
+  now += 4_999; reporter.publishCatalog("s", []);
+  assert.match(x.component?.render(60).join("\n") ?? "", /completed/);
+  now += 1; reporter.publishCatalog("s", []);
+  assert.deepEqual(x.component?.render(60), []);
+  assert.equal(x.widgets.length, mounted);
+  reporter.close();
+});
+
+test("tasks that finish within five seconds never flash in the widget", async () => {
+  let now = 1_000;
+  const bus = new Bus(), x = fake(bus); const reporter = registerTaskReporter(x.api, "python", { heartbeatMs: 0, now: () => now });
+  await x.fire("session_start");
+  const running: PresentedTask = { taskKey: "python:fast", source: "python", taskId: "fast", phase: "active", statusLabel: "running", createdAt: now, updatedAt: now };
+  reporter.publishCatalog("s", [running]);
+  now += 4_000;
+  reporter.publishCatalog("s", [{ ...running, phase: "completed", statusLabel: "completed", updatedAt: now, endedAt: now }]);
+  assert.deepEqual(x.component?.render(60), []);
+  reporter.close();
+});
+
 test("a shutdown owner does not block the next live session", async () => {
   const bus = new Bus(), first = fake(bus, "one"), second = fake(bus, "two");
   const a = registerTaskReporter(first.api, "python", { heartbeatMs: 60_000 });
