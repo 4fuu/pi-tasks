@@ -15,21 +15,40 @@ class Bus {
 }
 function fake(bus: Bus, session = "s") {
   const handlers = new Map<string, Handler[]>(), commands: string[] = [], widgets: Array<[string, unknown]> = [];
+  let stale = false, eventEmits = 0;
   let renders = 0;
   const tui = { terminal: { rows: 24 }, requestRender: () => { renders++; } };
   let component: { render(width: number): string[] } | undefined;
   const ui = {
-    setWidget: (key: string, value: unknown) => { widgets.push([key, value]); if (typeof value === "function") component = value(tui, theme); },
+    setWidget: (key: string, value: unknown) => {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      widgets.push([key, value]);
+      if (typeof value === "function") component = value(tui, theme);
+    },
     notify: () => undefined, custom: async () => undefined,
   };
   const theme = { fg: (_tone: string, value: string) => value, bold: (value: string) => value };
   const api = {
-    events: { emit: bus.emit.bind(bus), on: bus.on.bind(bus) },
+    events: {
+      emit: (channel: string, data: unknown) => {
+        eventEmits++;
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        bus.emit(channel, data);
+      },
+      on: bus.on.bind(bus),
+    },
     on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]),
     registerCommand: (name: string) => commands.push(name),
   } as unknown as ExtensionAPI;
   const ctx = { mode: "tui", sessionManager: { getSessionId: () => session }, ui } as unknown as ExtensionContext;
-  return { api, commands, widgets, get component() { return component; }, get renders() { return renders; }, async fire(name: string) { for (const h of handlers.get(name) ?? []) await h({}, ctx); } };
+  return {
+    api, commands, widgets,
+    get component() { return component; },
+    get renders() { return renders; },
+    get eventEmits() { return eventEmits; },
+    invalidate() { stale = true; },
+    async fire(name: string) { for (const h of handlers.get(name) ?? []) await h({}, ctx); },
+  };
 }
 const active = (key: string, source: PresentedTask["source"]): PresentedTask => ({ taskKey: key, source, taskId: key, phase: "active", statusLabel: "running", createdAt: 1, updatedAt: 2 });
 
@@ -108,6 +127,20 @@ test("a shutdown owner does not block the next live session", async () => {
   await second.fire("session_start");
   assert.deepEqual(second.commands, ["tasks"]);
   a.close(); b.close();
+});
+
+test("a stale heartbeat context is contained and stops the reporter", async () => {
+  const bus = new Bus(), x = fake(bus);
+  const reporter = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 5 });
+  try {
+    await x.fire("session_start");
+    const before = x.eventEmits;
+    x.invalidate();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(x.eventEmits, before + 1);
+  } finally {
+    reporter.close();
+  }
 });
 
 test("malformed and oversized bus payloads are harmless", () => {
