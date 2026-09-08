@@ -16,14 +16,23 @@ tasks.publishCatalog(sessionId, currentTasks);
 ```
 
 The package is installed transitively by task source plugins; users normally do
-not install or configure it directly. Run `/tasks` in interactive mode for a
-live catalog containing active and recent terminal tasks. Select with arrow
-keys, then press Enter to inspect, `r` to refresh, or `k` followed by `y` to
-stop a task that supports it. Escape returns or cancels confirmation without
-stopping anything. Reporters without controls remain read-only. The compact
-widget suppresses short-lived work: a task appears only after running for five
-seconds, then remains visible in its terminal state for at least five seconds
-before leaving the panel.
+not install or configure it directly. Run `/tasks` in interactive mode for the
+live Active list. Press Tab to switch between Active tasks and Inactive history
+(completed, failed, or cancelled tasks). An empty Active list stays open so Tab
+can reach history. Select with arrow keys, then press Enter to inspect, `r` to
+refresh, or `k` followed by `y` to stop a task that supports it. Escape returns
+or cancels confirmation without stopping anything. Reporters without controls
+remain read-only.
+
+After a successful stop reply and a terminal catalog update, the viewer returns
+to Active or closes if no active tasks remain. The stopped task remains in
+Inactive history. Errors, unknown outcomes, and missing or stale catalogs do not
+close the viewer. Natural completion does not leave inspection or history;
+inspection remains refreshable while the task is in the catalog.
+
+The compact widget suppresses short-lived work: a task appears only after
+running for five seconds, then remains visible in its terminal state for at
+least five seconds before leaving the panel.
 
 All task plugins must be upgraded together when migrating from older task
 packages. Mixed generations cannot coordinate their legacy widgets/commands with

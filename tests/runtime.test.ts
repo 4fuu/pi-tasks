@@ -308,3 +308,115 @@ test("published actions come from callbacks, and replies are bounded plain text"
     assert.match(replies[0].output, /output truncated/);
   } finally { r.close(); }
 });
+
+
+test("viewer defaults to active tasks, toggles history and clamps filtered selection", async () => {
+  const x = fake(new Bus()), r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0 });
+  try {
+    await x.fire("session_start");
+    const done: PresentedTask = { ...active("done", "pwsh"), phase: "completed" };
+    r.publishCatalog("s", [active("a", "pwsh"), active("b", "pwsh"), done]);
+    void x.open();
+    assert.match(screen(x, 32), /Tasks · Active/); assert.match(screen(x, 32), /Tab active\/inactive/);
+    assert.doesNotMatch(screen(x), /#done/);
+    x.viewer.handleInput("\x1b[F"); assert.match(screen(x), /> #b /);
+    x.viewer.handleInput("\t"); assert.match(screen(x), /Tasks · Inactive/); assert.match(screen(x), /> #done /);
+    assert.doesNotMatch(screen(x), /#[ab] /);
+    x.viewer.handleInput("\t"); assert.match(screen(x), /> #a /);
+    r.publishCatalog("s", [done]); assert.match(screen(x), /No active tasks/);
+    x.viewer.handleInput("\t"); assert.match(screen(x), /> #done /);
+    x.viewer.handleInput("\x1b");
+    void x.open(); assert.match(screen(x), /No active tasks/);
+    x.viewer.handleInput("\t"); assert.match(screen(x), /#done/);
+  } finally { r.close(); }
+});
+
+test("natural completion retains inspection and history with refresh against the full catalog", async () => {
+  const x = fake(new Bus()); let calls = 0;
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => `inspection ${++calls}` } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", [active("t", "pwsh")]);
+    void x.open(); x.viewer.handleInput("\r"); await settle();
+    r.publishCatalog("s", [{ ...active("t", "pwsh"), phase: "completed" }]);
+    assert.match(screen(x), /inspection 1/);
+    x.viewer.handleInput("r"); await settle(); assert.match(screen(x), /inspection 2/);
+    x.viewer.handleInput("\r"); assert.match(screen(x), /No active tasks/);
+    x.viewer.handleInput("\t"); r.publishCatalog("s", [{ ...active("t", "pwsh"), phase: "completed" }]);
+    assert.match(screen(x), /Inactive/); assert.match(screen(x), /#t /);
+    x.viewer.handleInput("\r"); await settle(); assert.match(screen(x), /inspection 3/);
+  } finally { r.close(); }
+});
+
+test("successful confirmed stop returns to active tasks or closes after the last active task", async () => {
+  for (const otherActive of [true, false]) {
+    const x = fake(new Bus()); const remaining = otherActive ? [active("other", "pwsh")] : [];
+    const stopped: PresentedTask = { ...active("target", "pwsh"), phase: "cancelled", statusLabel: "stopped" };
+    const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: {
+      inspect: async () => "inspect", stop: async () => { r.publishCatalog("s", [...remaining, stopped]); return "stopped"; },
+    } });
+    try {
+      await x.fire("session_start"); r.publishCatalog("s", [active("target", "pwsh"), ...remaining]);
+      void x.open(); x.viewer.handleInput("\x1b[F"); x.viewer.handleInput("k"); x.viewer.handleInput("y"); await settle();
+      if (otherActive) {
+        assert.match(screen(x), /Active/); assert.match(screen(x), /> #other /); assert.doesNotMatch(screen(x), /#target/);
+        x.viewer.handleInput("\t"); assert.match(screen(x), /#target/);
+      } else assert.equal(screen(x), "");
+    } finally { r.close(); }
+  }
+});
+
+test("stop waits for both reply and terminal catalog, including delayed catalogs and omitted active tasks", async () => {
+  for (const omittedActive of [0, 1]) {
+    let now = 10; const bus = new Bus(), x = fake(bus); let request: Record<string, unknown> | undefined;
+    bus.on(TASKS_CONTROL_CHANNEL, raw => { const e = raw as Record<string, unknown>; if (e.type === "request") request = e; });
+    const r = registerTaskReporter(x.api, "python", { heartbeatMs: 0, now: () => now });
+    const publish = (tasks: PresentedTask[], observedAt = now) => bus.emit(TASKS_CHANNEL, { v: 1, type: "catalog", sessionId: "s", participantId: "remote", source: "pwsh", observedAt, tasks, omittedActive });
+    const t: PresentedTask = { ...active("t", "pwsh"), actions: ["inspect", "stop"] };
+    try {
+      await x.fire("session_start"); publish([t]); void x.open(); x.viewer.handleInput("k"); x.viewer.handleInput("y");
+      assert.match(screen(x), /Stopping/);
+      bus.emit(TASKS_CONTROL_CHANNEL, { ...request, type: "reply", ok: true, output: "accepted" }); await settle();
+      assert.match(screen(x), /accepted/); // An active catalog is not proof of termination.
+      publish([]); assert.match(screen(x), /accepted/); // Neither is a missing task.
+      now = 4000; publish([{ ...t, phase: "cancelled" }], 10); assert.match(screen(x), /accepted/);
+      publish([{ ...t, phase: "cancelled" }]);
+      if (omittedActive) { assert.match(screen(x), /Active · 1 active/); assert.match(screen(x), /No active tasks/); }
+      else assert.equal(screen(x), "");
+    } finally { r.close(); }
+  }
+});
+
+test("rejected or timed-out stops stay open even after a terminal catalog arrives", async () => {
+  for (const reject of [true, false]) {
+    const bus = new Bus(), x = fake(bus); let request: Record<string, unknown> | undefined;
+    bus.on(TASKS_CONTROL_CHANNEL, raw => { const e = raw as Record<string, unknown>; if (e.type === "request") request = e; });
+    const r = registerTaskReporter(x.api, "python", { heartbeatMs: 0, controlTimeoutMs: 20 });
+    const publish = (phase: PresentedTask["phase"]) => bus.emit(TASKS_CHANNEL, { v: 1, type: "catalog", sessionId: "s", participantId: "remote", source: "pwsh", observedAt: Date.now(), tasks: [{ ...active("t", "pwsh"), phase, actions: ["inspect", "stop"] }] });
+    try {
+      await x.fire("session_start"); publish("active"); void x.open(); x.viewer.handleInput("k"); x.viewer.handleInput("y");
+      publish("cancelled"); assert.match(screen(x), /Stopping/);
+      if (reject) bus.emit(TASKS_CONTROL_CHANNEL, { ...request, type: "reply", ok: false, output: "denied" });
+      await new Promise(resolve => setTimeout(resolve, 35));
+      assert.match(screen(x), reject ? /Error: denied/ : /outcome is unknown/);
+      bus.emit(TASKS_CONTROL_CHANNEL, { ...request, type: "reply", ok: true, output: "late" }); await settle();
+      publish("cancelled"); assert.match(screen(x), /Error:/);
+    } finally { r.close(); }
+  }
+});
+
+test("Escape during a stop or while awaiting its catalog prevents later UI transitions", async () => {
+  for (const escapeBeforeReply of [true, false]) {
+    const x = fake(new Bus()); let resolve!: (output: string) => void;
+    const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "inspect", stop: () => new Promise(r => { resolve = r; }) } });
+    try {
+      await x.fire("session_start"); r.publishCatalog("s", [active("t", "pwsh")]);
+      void x.open(); x.viewer.handleInput("k"); x.viewer.handleInput("y");
+      if (escapeBeforeReply) x.viewer.handleInput("\x1b");
+      resolve("stopped"); await settle();
+      if (!escapeBeforeReply) x.viewer.handleInput("\x1b");
+      x.viewer.handleInput("\t");
+      r.publishCatalog("s", [{ ...active("t", "pwsh"), phase: "cancelled" }]); await settle();
+      assert.match(screen(x), /Inactive/); assert.match(screen(x), /#t /);
+    } finally { r.close(); }
+  }
+});

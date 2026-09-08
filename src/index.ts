@@ -90,15 +90,28 @@ export class TasksViewer implements Component {
   private selected?: string; private index = 0; private offset = 0; private page = 1; private max = 0;
   private mode: "list" | "detail" | "confirm" = "list";
   private target?: RoutedTask; private output = ""; private busy = false; private generation = 0; private disposed = false;
+  private inactive = false; private stopped?: string;
   constructor(private readonly snapshot: Aggregate | (() => Aggregate), private readonly tui: TUI, private readonly theme: Theme, private readonly close: () => void, private readonly openedAt = Date.now(), private readonly act?: (task: RoutedTask, action: TaskAction) => Promise<string>) {}
   dispose(): void { this.disposed = true; this.generation++; }
   dismiss(): void { if (this.disposed) return; this.dispose(); try { this.close(); } catch { /* Session UI may already be gone. */ } }
-  update(): void { if (!this.disposed) { try { this.tui.requestRender(); } catch { this.dispose(); } } }
+  update(): void {
+    if (this.disposed) return;
+    if (this.stopped) {
+      const state = typeof this.snapshot === "function" ? this.snapshot() : this.snapshot;
+      if (state.tasks.some(t => identity(t) === this.stopped && t.phase !== "active")) {
+        this.stopped = undefined; this.inactive = false; this.mode = "list"; this.offset = 0;
+        if (state.activeTotal === 0) { this.dismiss(); return; }
+      }
+    }
+    try { this.tui.requestRender(); } catch { this.dispose(); }
+  }
+  private listed(state: Aggregate): RoutedTask[] { return state.tasks.filter(t => (t.phase !== "active") === this.inactive); }
   private state(): Aggregate {
     const state = typeof this.snapshot === "function" ? this.snapshot() : this.snapshot;
-    const found = state.tasks.findIndex(t => identity(t) === this.selected);
-    this.index = found >= 0 ? found : Math.max(0, Math.min(this.index, state.tasks.length - 1));
-    this.selected = state.tasks[this.index] ? identity(state.tasks[this.index]) : undefined;
+    const tasks = this.listed(state);
+    const found = tasks.findIndex(t => identity(t) === this.selected);
+    this.index = found >= 0 ? found : Math.max(0, Math.min(this.index, tasks.length - 1));
+    this.selected = tasks[this.index] ? identity(tasks[this.index]) : undefined;
     return state;
   }
   private inspect(t: RoutedTask): void {
@@ -108,12 +121,12 @@ export class TasksViewer implements Component {
     this.update();
   }
   private run(t: RoutedTask, action: TaskAction): void {
-    const generation = ++this.generation;
+    const generation = ++this.generation; this.stopped = undefined;
     this.mode = "detail"; this.target = t; this.busy = true; this.output = `${action === "stop" ? "Stopping" : "Inspecting"} #${plain(t.taskId)}…`; this.offset = 0; this.update();
     void (async () => {
       try {
         const output = await this.act!(t, action);
-        if (!this.disposed && generation === this.generation) this.output = plain(output);
+        if (!this.disposed && generation === this.generation) { this.output = plain(output); if (action === "stop") this.stopped = identity(t); }
       } catch (error) {
         if (!this.disposed && generation === this.generation) this.output = `Error: ${plain(error instanceof Error ? error.message : String(error))}`;
       } finally {
@@ -125,9 +138,10 @@ export class TasksViewer implements Component {
     if (this.disposed) return;
     if (matchesKey(d, Key.escape) || matchesKey(d, Key.ctrl("c"))) {
       if (this.mode === "list") this.dismiss();
-      else { this.generation++; this.busy = false; this.mode = "list"; this.offset = 0; this.update(); }
+      else { this.generation++; this.stopped = undefined; this.busy = false; this.mode = "list"; this.offset = 0; this.update(); }
       return;
     }
+    if (this.mode === "list" && matchesKey(d, Key.tab)) { this.inactive = !this.inactive; this.state(); this.update(); return; }
     const state = this.state();
     if (this.mode === "confirm") {
       if (matchesKey(d, "y")) {
@@ -145,23 +159,24 @@ export class TasksViewer implements Component {
       } else this.update();
       return;
     }
-    if (this.mode === "detail" && matchesKey(d, Key.enter)) { this.mode = "list"; this.offset = 0; this.update(); return; }
-    const t = this.mode === "list" ? state.tasks[this.index] : state.tasks.find(t => this.target && identity(t) === identity(this.target));
+    if (this.mode === "detail" && matchesKey(d, Key.enter)) { this.stopped = undefined; this.mode = "list"; this.offset = 0; this.update(); return; }
+    const tasks = this.listed(state);
+    const t = this.mode === "list" ? tasks[this.index] : state.tasks.find(t => this.target && identity(t) === identity(this.target));
     if (matchesKey(d, "k") && t) {
       if (t.phase === "active" && t.actions?.includes("stop") && this.act) { this.target = t; this.mode = "confirm"; this.update(); }
       return;
     }
     if (this.mode === "list" && matchesKey(d, Key.enter) && t) { this.inspect(t); return; }
     let n = this.mode === "list" ? this.index : this.offset;
-    const max = this.mode === "list" ? state.tasks.length - 1 : this.max;
+    const max = this.mode === "list" ? tasks.length - 1 : this.max;
     if (matchesKey(d, Key.up)) n--; else if (matchesKey(d, Key.down)) n++; else if (matchesKey(d, Key.pageUp)) n -= this.page; else if (matchesKey(d, Key.pageDown)) n += this.page; else if (matchesKey(d, Key.home)) n = 0; else if (matchesKey(d, Key.end)) n = max; else return;
     n = Math.max(0, Math.min(max, n));
-    if (this.mode === "list") { this.index = n; this.selected = state.tasks[n] ? identity(state.tasks[n]) : undefined; } else this.offset = n;
+    if (this.mode === "list") { this.index = n; this.selected = tasks[n] ? identity(tasks[n]) : undefined; } else this.offset = n;
     this.update();
   }
   render(width: number): string[] {
     if (width <= 0 || this.disposed) return [];
-    const state = this.state(); this.page = Math.max(1, this.tui.terminal.rows - 7);
+    const state = this.state(), tasks = this.listed(state); this.page = Math.max(1, this.tui.terminal.rows - 7);
     let body: string[], hint: string;
     if (this.mode === "confirm") {
       body = [`Stop #${plain(this.target?.taskId ?? "").replace(/\n/g, " ")} (${this.target?.source})?`, "Press y to confirm. This requests termination."];
@@ -172,11 +187,11 @@ export class TasksViewer implements Component {
       hint = this.busy ? "Busy · Esc back (request continues)" : "↑↓ scroll · r inspect again · Enter/Esc list · k stop";
     } else {
       const start = Math.max(0, this.index - this.page + 1);
-      body = state.tasks.slice(start, start + this.page).map((t, i) => `${start + i === this.index ? ">" : " "} #${plain(t.taskId).replace(/\n/g, " ")} · ${t.source} · ${plain(t.statusLabel).replace(/\n/g, " ")}${t.actions?.length ? ` [${t.actions.join("/")}]` : " [read-only]"}${t.summary || t.meta ? ` · ${plain(t.summary || t.meta || "").replace(/\n/g, " ")}` : ""}`);
-      if (!body.length) body = ["No tasks."];
-      hint = "↑↓ select · PgUp/PgDn · Home/End · Enter inspect · k stop · r refresh · Esc close";
+      body = tasks.slice(start, start + this.page).map((t, i) => `${start + i === this.index ? ">" : " "} #${plain(t.taskId).replace(/\n/g, " ")} · ${t.source} · ${plain(t.statusLabel).replace(/\n/g, " ")}${t.actions?.length ? ` [${t.actions.join("/")}]` : " [read-only]"}${t.summary || t.meta ? ` · ${plain(t.summary || t.meta || "").replace(/\n/g, " ")}` : ""}`);
+      if (!body.length) body = [`No ${this.inactive ? "inactive" : "active"} tasks.`];
+      hint = "Tab active/inactive · ↑↓ select · PgUp/PgDn · Home/End · Enter inspect · k stop · r refresh · Esc close";
     }
-    return [this.theme.fg("accent", this.theme.bold(`Tasks · ${state.activeTotal} active`)), this.theme.fg("borderMuted", "─".repeat(width)), ...body, this.theme.fg("dim", `${state.omitted} omitted · ${state.tasks.length} listed`), this.theme.fg("dim", hint)].map(line => truncateToWidth(line, width));
+    return [this.theme.fg("accent", this.theme.bold(`Tasks · ${this.inactive ? "Inactive" : "Active"} · ${state.activeTotal} active`)), this.theme.fg("borderMuted", "─".repeat(width)), ...body, this.theme.fg("dim", `${state.omitted} omitted · ${tasks.length} listed`), this.theme.fg("dim", hint)].map(line => truncateToWidth(line, width));
   }
   invalidate(): void {}
 }
