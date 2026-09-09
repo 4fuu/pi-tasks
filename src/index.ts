@@ -4,8 +4,8 @@ import { Key, matchesKey, truncateToWidth, type Component, type TUI, visibleWidt
 
 export const TASKS_CHANNEL = "@4fu/pi-tasks/v1";
 export const TASKS_CONTROL_CHANNEL = "@4fu/pi-tasks/control/v1";
-export type TaskAction = "inspect" | "stop";
-export interface TaskControls { inspect(taskId: string): Promise<string>; stop?(taskId: string): Promise<string> }
+export type TaskAction = "inspect" | "stop" | "delete";
+export interface TaskControls { inspect(taskId: string): Promise<string>; stop?(taskId: string): Promise<string>; delete?(taskId: string): Promise<string> }
 export const TASKS_WIDGET_KEY = "pi-tasks-active";
 export type TaskSource = "python" | "pwsh" | "subagent";
 export type TaskPhase = "active" | "completed" | "failed" | "cancelled";
@@ -36,7 +36,7 @@ function plain(value: string): string {
 function controlWire(value: unknown): ControlWire | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const x = value as Record<string, unknown>;
-  if (x.v !== 1 || (x.type !== "request" && x.type !== "reply") || !source(x.source) || (x.action !== "inspect" && x.action !== "stop")) return;
+  if (x.v !== 1 || (x.type !== "request" && x.type !== "reply") || !source(x.source) || (x.action !== "inspect" && x.action !== "stop" && x.action !== "delete")) return;
   for (const key of ["sessionId", "participantId", "requesterId", "taskKey", "taskId", "requestId"]) if (typeof x[key] !== "string" || !x[key] || (x[key] as string).length > 256) return;
   if (x.type === "reply" && (typeof x.ok !== "boolean" || typeof x.output !== "string")) return;
   return { v: 1, type: x.type, sessionId: x.sessionId, participantId: x.participantId, requesterId: x.requesterId, taskKey: x.taskKey, taskId: x.taskId, requestId: x.requestId, source: x.source, action: x.action, ...(x.type === "reply" ? { ok: x.ok, output: plain(x.output as string) } : {}) } as ControlWire;
@@ -56,7 +56,7 @@ function task(v: unknown, expected?: TaskSource): PresentedTask | undefined {
   const taskKey = text(x.taskKey, 256, true), taskId = text(x.taskId, 128, true), statusLabel = text(x.statusLabel, 80, true);
   const createdAt = num(x.createdAt), updatedAt = num(x.updatedAt);
   if (!taskKey || !taskId || !statusLabel || !source(s) || (expected && s !== expected) || !phase(p) || createdAt === undefined || updatedAt === undefined) return;
-  const actions: TaskAction[] = Array.isArray(x.actions) ? ["inspect", ...(p === "active" ? ["stop"] : [])].filter(a => (x.actions as unknown[]).includes(a)) as TaskAction[] : [];
+  const actions: TaskAction[] = Array.isArray(x.actions) ? ["inspect", p === "active" ? "stop" : "delete"].filter(a => (x.actions as unknown[]).includes(a)) as TaskAction[] : [];
   return { taskKey, source: s, taskId, phase: p, statusLabel, createdAt, updatedAt, startedAt: num(x.startedAt), endedAt: num(x.endedAt), summary: text(x.summary, 1000), meta: text(x.meta, 500), ...(actions.length ? { actions } : {}) };
 }
 function wire(v: unknown): Wire | undefined {
@@ -72,6 +72,7 @@ function wire(v: unknown): Wire | undefined {
 }
 function compare(a: PresentedTask, b: PresentedTask): number { return (a.startedAt ?? a.createdAt) - (b.startedAt ?? b.createdAt) || a.source.localeCompare(b.source) || a.taskKey.localeCompare(b.taskKey); }
 function identity(t: RoutedTask): string { return JSON.stringify([t.participantId, t.source, t.taskKey, t.taskId]); }
+function supports(t: PresentedTask | undefined, action: TaskAction): boolean { return !!t?.actions?.includes(action) && (action === "inspect" || (action === "stop" ? t.phase === "active" : t.phase !== "active")); }
 function duration(ms: number): string { const n = Math.max(0, ms); return n < 60_000 ? `${(n / 1000).toFixed(1)}s` : `${Math.floor(n / 60_000)}m ${Math.round(n % 60_000 / 1000)}s`; }
 
 class TasksWidget implements Component {
@@ -88,9 +89,10 @@ class TasksWidget implements Component {
 }
 export class TasksViewer implements Component {
   private selected?: string; private index = 0; private offset = 0; private page = 1; private max = 0;
-  private mode: "list" | "detail" | "confirm" = "list";
+  private mode: "list" | "detail" | "confirm" | "clear" = "list";
   private target?: RoutedTask; private output = ""; private busy = false; private generation = 0; private disposed = false;
   private inactive = false; private stopped?: string;
+  private batch: RoutedTask[] = [];
   constructor(private readonly snapshot: Aggregate | (() => Aggregate), private readonly tui: TUI, private readonly theme: Theme, private readonly close: () => void, private readonly openedAt = Date.now(), private readonly act?: (task: RoutedTask, action: TaskAction) => Promise<string>) {}
   dispose(): void { this.disposed = true; this.generation++; }
   dismiss(): void { if (this.disposed) return; this.dispose(); try { this.close(); } catch { /* Session UI may already be gone. */ } }
@@ -134,6 +136,32 @@ export class TasksViewer implements Component {
       }
     })();
   }
+  private remove(targets: RoutedTask[]): void {
+    const generation = ++this.generation;
+    this.stopped = undefined; this.target = undefined; this.busy = true; this.mode = "detail"; this.offset = 0;
+    this.output = `Deleting ${targets.length} listed inactive task(s)…`; this.update();
+    void (async () => {
+      const errors: string[] = []; let deleted = 0;
+      for (const target of targets) {
+        if (this.disposed || generation !== this.generation) return;
+        try {
+          const current = this.state().tasks.find(t => identity(t) === identity(target));
+          if (!supports(current, "delete") || !this.act) throw new Error("Task action is no longer available");
+          await this.act(current!, "delete");
+          deleted++;
+        } catch (error) {
+          errors.push(`#${plain(target.taskId)}: ${plain(error instanceof Error ? error.message : String(error))}`);
+        }
+        if (this.disposed || generation !== this.generation) return;
+        this.output = plain(`${deleted}/${targets.length} deleted${errors.length ? `\nErrors:\n${errors.join("\n")}` : ""}`); this.update();
+      }
+      if (this.disposed || generation !== this.generation) return;
+      this.busy = false;
+      // Catalogs, not replies, control membership. Keep partial failures visible.
+      if (!errors.length) { this.mode = "list"; this.inactive = true; }
+      this.update();
+    })();
+  }
   handleInput(d: string): void {
     if (this.disposed) return;
     if (matchesKey(d, Key.escape) || matchesKey(d, Key.ctrl("c"))) {
@@ -143,6 +171,11 @@ export class TasksViewer implements Component {
     }
     if (this.mode === "list" && matchesKey(d, Key.tab)) { this.inactive = !this.inactive; this.state(); this.update(); return; }
     const state = this.state();
+    if (this.mode === "clear") {
+      if (matchesKey(d, "y")) this.remove(this.batch);
+      else if (matchesKey(d, "n")) { this.mode = "list"; this.update(); }
+      return;
+    }
     if (this.mode === "confirm") {
       if (matchesKey(d, "y")) {
         const current = state.tasks.find(t => this.target && identity(t) === identity(this.target));
@@ -162,6 +195,12 @@ export class TasksViewer implements Component {
     if (this.mode === "detail" && matchesKey(d, Key.enter)) { this.stopped = undefined; this.mode = "list"; this.offset = 0; this.update(); return; }
     const tasks = this.listed(state);
     const t = this.mode === "list" ? tasks[this.index] : state.tasks.find(t => this.target && identity(t) === identity(this.target));
+    if (matchesKey(d, "d") && supports(t, "delete") && this.act) { this.remove([t!]); return; }
+    if (this.mode === "list" && this.inactive && matchesKey(d, "x") && this.act) {
+      this.batch = tasks.filter(t => supports(t, "delete")).map(t => ({ ...t }));
+      if (this.batch.length) { this.mode = "clear"; this.update(); }
+      return;
+    }
     if (matchesKey(d, "k") && t) {
       if (t.phase === "active" && t.actions?.includes("stop") && this.act) { this.target = t; this.mode = "confirm"; this.update(); }
       return;
@@ -177,19 +216,24 @@ export class TasksViewer implements Component {
   render(width: number): string[] {
     if (width <= 0 || this.disposed) return [];
     const state = this.state(), tasks = this.listed(state); this.page = Math.max(1, this.tui.terminal.rows - 7);
+    const t = this.mode === "list" ? tasks[this.index] : state.tasks.find(t => this.target && identity(t) === identity(this.target));
+    const actionHint = this.act ? `${supports(t, "stop") ? " · k stop" : ""}${supports(t, "delete") ? " · d delete" : ""}` : "";
     let body: string[], hint: string;
-    if (this.mode === "confirm") {
+    if (this.mode === "clear") {
+      body = [`Delete ${this.batch.length} listed inactive task(s)?`, "Read-only and omitted tasks are kept. Unseen history is not cleared."];
+      hint = "y delete listed · n/Esc back (no deletion)";
+    } else if (this.mode === "confirm") {
       body = [`Stop #${plain(this.target?.taskId ?? "").replace(/\n/g, " ")} (${this.target?.source})?`, "Press y to confirm. This requests termination."];
       hint = "y stop · n/Esc back (no stop)";
     } else if (this.mode === "detail") {
       body = this.output.split("\n").flatMap(line => wrapTextWithAnsi(line, width));
       this.max = Math.max(0, body.length - this.page); this.offset = Math.min(this.offset, this.max); body = body.slice(this.offset, this.offset + this.page);
-      hint = this.busy ? "Busy · Esc back (request continues)" : "↑↓ scroll · r inspect again · Enter/Esc list · k stop";
+      hint = this.busy ? "Busy · Esc back (current request continues; queue stops)" : `↑↓ scroll${supports(t, "inspect") && this.act ? " · r inspect again" : ""} · Enter/Esc list${actionHint}`;
     } else {
       const start = Math.max(0, this.index - this.page + 1);
       body = tasks.slice(start, start + this.page).map((t, i) => `${start + i === this.index ? ">" : " "} #${plain(t.taskId).replace(/\n/g, " ")} · ${t.source} · ${plain(t.statusLabel).replace(/\n/g, " ")}${t.actions?.length ? ` [${t.actions.join("/")}]` : " [read-only]"}${t.summary || t.meta ? ` · ${plain(t.summary || t.meta || "").replace(/\n/g, " ")}` : ""}`);
       if (!body.length) body = [`No ${this.inactive ? "inactive" : "active"} tasks.`];
-      hint = "Tab active/inactive · ↑↓ select · Enter inspect · k stop · r refresh · Esc close";
+      hint = `Tab active/inactive · ↑↓${t ? " · Enter inspect" : ""}${actionHint}${this.inactive && this.act && tasks.some(t => supports(t, "delete")) ? " · x clear listed" : " · r refresh"} · Esc close`;
     }
     return [this.theme.fg("accent", this.theme.bold(`Tasks · ${this.inactive ? "Inactive" : "Active"} · ${state.activeTotal} active`)), this.theme.fg("borderMuted", "─".repeat(width)), ...body, this.theme.fg("dim", `${state.omitted} omitted · ${tasks.length} listed`), this.theme.fg("dim", hint)].map(line => truncateToWidth(line, width));
   }
@@ -211,7 +255,7 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
   function requestControl(t: RoutedTask, action: TaskAction): Promise<string> {
     const c = t.participantId ? catalogs.get(t.participantId) : undefined;
     const current = c?.tasks.find(x => x.taskKey === t.taskKey && x.taskId === t.taskId && x.source === t.source);
-    if (closed || !eligible || !sessionId || !c || c.sessionId !== sessionId || now() - c.observedAt > catalogStaleMs || !current?.actions?.includes(action) || (action === "stop" && current.phase !== "active")) return Promise.reject(new Error("Task action is no longer available"));
+    if (closed || !eligible || !sessionId || !c || c.sessionId !== sessionId || now() - c.observedAt > catalogStaleMs || !supports(current, action)) return Promise.reject(new Error("Task action is no longer available"));
     const address: ControlAddress = { sessionId, participantId: c.participantId, requesterId: id, taskKey: t.taskKey, taskId: t.taskId, source: t.source, requestId: randomUUID(), action };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { pending.delete(address.requestId); reject(new Error("Task action timed out; its outcome is unknown")); }, Math.max(1, options.controlTimeoutMs ?? 10_000));
@@ -232,7 +276,7 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
     seenRequests.add(key); if (seenRequests.size > 1000) seenRequests.delete(seenRequests.values().next().value!);
     const current = local?.tasks.find(t => t.taskKey === e.taskKey && t.taskId === e.taskId && t.source === e.source);
     const callback = options.controls?.[e.action];
-    if (!local || local.sessionId !== sessionId || local.participantId !== id || local.source !== e.source || now() - local.observedAt > catalogStaleMs || !current?.actions?.includes(e.action) || (e.action === "stop" && current.phase !== "active") || !callback) {
+    if (!local || local.sessionId !== sessionId || local.participantId !== id || local.source !== e.source || now() - local.observedAt > catalogStaleMs || !supports(current, e.action) || !callback) {
       emitControl({ ...e, type: "reply", ok: false, output: "Task action is no longer available" }); return;
     }
     const epoch = generation;
@@ -254,26 +298,39 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
   function render(): void { for (const viewer of viewers) viewer.update(); if (!owner || !widget || !tui) return; const next = widgetState(); const signature = JSON.stringify(next); if (signature === renderSignature) return; renderSignature = signature; widget.setState(next); tui.requestRender(); }
   function announce(replay = true): void { if (!eligible || !sessionId) return; if (!emit({ v: 1, type: "participant", sessionId, participantId: id, source: reporterSource, seenAt: now() })) return; if (replay && local) emit({ v: 1, type: "catalog", ...local }); }
   const unsubscribe = pi.events.on(TASKS_CHANNEL, raw => { const e = wire(raw); if (!e) return; if (e.type === "probe") { if (owner && eligible && e.sessionId === sessionId) emit({ v: 1, type: "owner", token: e.token, participantId: id }); if (eligible && e.sessionId === sessionId) announce(); return; } if (e.type === "participant") participants.set(e.participantId, { sessionId: e.sessionId, seenAt: now() }); else if (e.type === "leave") { participants.delete(e.participantId); catalogs.delete(e.participantId); } else if (e.type === "catalog") catalogs.set(e.participantId, e); render(); });
+  let opening: object | undefined;
+  async function openViewer(ctx: ExtensionContext): Promise<void> {
+    if (ctx.mode !== "tui") return ctx.ui.notify("/tasks requires interactive mode", "error");
+    if (!owner || !eligible || closed || opening || ctx.sessionManager.getSessionId() !== sessionId) return;
+    const token = opening = {}; const epoch = generation;
+    let viewer: TasksViewer | undefined;
+    try { await ctx.ui.custom<void>((viewTui, theme, _keys, done) => {
+      viewer = new TasksViewer(aggregate, viewTui, theme, () => { if (opening === token) opening = undefined; done(); }, now(), requestControl);
+      if (epoch !== generation || !eligible || closed) viewer.dismiss(); else viewers.add(viewer);
+      return viewer;
+    }); } finally {
+      if (viewer) { viewer.dispose(); viewers.delete(viewer); }
+      if (opening === token) opening = undefined;
+    }
+  }
   pi.on("session_start", (_event, ctx) => {
     if (closed) return;
     if (eligible) shutdown();
     sessionId = ctx.sessionManager.getSessionId(); eligible = true; const token = randomUUID(); let acknowledged = false;
     const off = pi.events.on(TASKS_CHANNEL, raw => { const e = wire(raw); if (e?.type === "owner" && e.token === token) acknowledged = true; }); emit({ v: 1, type: "probe", sessionId, token }); off();
     if (!acknowledged && !owner) { owner = true; emit({ v: 1, type: "owner", token, participantId: id }); }
-    if (owner && !command) { command = true; pi.registerCommand("tasks", { description: "Show all background tasks", handler: async (_args, commandCtx) => {
-      if (commandCtx.mode !== "tui") return commandCtx.ui.notify("/tasks requires interactive mode", "error");
-      if (!eligible || closed || commandCtx.sessionManager.getSessionId() !== sessionId) return;
-      let viewer: TasksViewer | undefined;
-      try { await commandCtx.ui.custom<void>((viewTui, theme, _keys, done) => {
-        viewer = new TasksViewer(aggregate, viewTui, theme, done, now(), requestControl); viewers.add(viewer); return viewer;
-      }); } finally { if (viewer) { viewer.dispose(); viewers.delete(viewer); } }
-    } }); }
+    if (owner && !command) {
+      command = true;
+      pi.registerCommand("tasks", { description: "Show all background tasks", handler: async (_args, ctx) => openViewer(ctx) });
+      pi.registerShortcut("ctrl+alt+t", { description: "Show background tasks", handler: openViewer });
+    }
     if (owner && ctx.mode === "tui") { mounted = true; widgetContext = ctx; ctx.ui.setWidget(TASKS_WIDGET_KEY, (newTui, theme) => { tui = newTui; const initial = widgetState(); renderSignature = JSON.stringify(initial); widget = new TasksWidget(initial, theme); return widget; }, { placement: "aboveEditor" }); }
     announce(); if (heartbeatMs > 0 && !timer) { timer = setInterval(() => { announce(); const n = now(); for (const [key,p] of participants) if (n-p.seenAt > participantStaleMs) { participants.delete(key); catalogs.delete(key); } render(); }, heartbeatMs); timer.unref?.(); }
   });
   function clearSession(ctx?: ExtensionContext): string | undefined {
     const previousSessionId = sessionId;
     generation++; for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error("Task session closed")); } pending.clear(); seenRequests.clear();
+    opening = undefined;
     for (const viewer of viewers) viewer.dismiss(); viewers.clear();
     eligible = false; if (timer) clearInterval(timer); timer = undefined; local = undefined; participants.clear(); catalogs.clear(); widgetRecords.clear();
     if (owner && mounted) { try { (ctx ?? widgetContext)?.ui.setWidget(TASKS_WIDGET_KEY, undefined); } catch { /* The captured context may already be stale. */ } }
@@ -282,5 +339,5 @@ export function registerTaskReporter(pi: ExtensionAPI, reporterSource: TaskSourc
   }
   function shutdown(ctx?: ExtensionContext): void { const previousSessionId = clearSession(ctx); if (previousSessionId) emit({ v: 1, type: "leave", sessionId: previousSessionId, participantId: id }); }
   pi.on("session_shutdown", (_event, ctx) => shutdown(ctx));
-  return { publishCatalog(sid, input) { if (closed || !sessionId || sid !== sessionId) return; const normalized = input.flatMap(v => { const t = task(v, reporterSource); if (!t) return []; delete t.actions; if (options.controls) t.actions = ["inspect", ...(t.phase === "active" && options.controls.stop ? ["stop" as const] : [])]; return [t]; }); const active = normalized.filter(t => t.phase === "active").sort(compare); const terminal = normalized.filter(t => t.phase !== "active").sort((a,b) => b.updatedAt-a.updatedAt || compare(a,b)); const kept = [...active.slice(0,CAP), ...terminal.slice(0, Math.max(0,CAP-active.length))]; local = { sessionId, participantId: id, source: reporterSource, observedAt: now(), tasks: kept, omittedActive: Math.max(0,active.length-CAP), omittedTerminal: Math.max(0, terminal.length-Math.max(0,CAP-active.length)) }; emit({ v: 1, type: "catalog", ...local }); }, close() { if (closed) return; closed = true; shutdown(); unsubscribe(); unsubscribeControl(); } };
+  return { publishCatalog(sid, input) { if (closed || !sessionId || sid !== sessionId) return; const normalized = input.flatMap(v => { const t = task(v, reporterSource); if (!t) return []; delete t.actions; if (options.controls) t.actions = ["inspect", ...(t.phase === "active" && options.controls.stop ? ["stop" as const] : []), ...(t.phase !== "active" && options.controls.delete ? ["delete" as const] : [])]; return [t]; }); const active = normalized.filter(t => t.phase === "active").sort(compare); const terminal = normalized.filter(t => t.phase !== "active").sort((a,b) => b.updatedAt-a.updatedAt || compare(a,b)); const kept = [...active.slice(0,CAP), ...terminal.slice(0, Math.max(0,CAP-active.length))]; local = { sessionId, participantId: id, source: reporterSource, observedAt: now(), tasks: kept, omittedActive: Math.max(0,active.length-CAP), omittedTerminal: Math.max(0, terminal.length-Math.max(0,CAP-active.length)) }; emit({ v: 1, type: "catalog", ...local }); }, close() { if (closed) return; closed = true; shutdown(); unsubscribe(); unsubscribeControl(); } };
 }

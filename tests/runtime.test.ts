@@ -18,6 +18,8 @@ function fake(bus: Bus, session = "s") {
   const handlers = new Map<string, Handler[]>(), commands: string[] = [], widgets: Array<[string, unknown]> = [];
   let stale = false, eventEmits = 0;
   let commandHandler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  const shortcuts = new Map<string, (ctx: ExtensionContext) => Promise<void>>();
+  let customCalls = 0;
   let viewer: TasksViewer | undefined;
   let renders = 0;
   const tui = { terminal: { rows: 24 }, requestRender: () => { renders++; } };
@@ -29,7 +31,7 @@ function fake(bus: Bus, session = "s") {
       if (typeof value === "function") component = value(tui, theme);
     },
     notify: () => undefined,
-    custom: (factory: (tui: TUI, theme: Theme, keys: unknown, done: () => void) => TasksViewer) => new Promise<void>(resolve => { viewer = factory(tui as TUI, theme as Theme, {}, resolve); }),
+    custom: (factory: (tui: TUI, theme: Theme, keys: unknown, done: () => void) => TasksViewer) => new Promise<void>(resolve => { customCalls++; viewer = factory(tui as TUI, theme as Theme, {}, resolve); }),
   };
   const theme = { fg: (_tone: string, value: string) => value, bold: (value: string) => value };
   const api = {
@@ -43,10 +45,14 @@ function fake(bus: Bus, session = "s") {
     },
     on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]),
     registerCommand: (name: string, definition: { handler: typeof commandHandler }) => { commands.push(name); commandHandler = definition.handler; },
+    registerShortcut: (name: string, definition: { handler: (ctx: ExtensionContext) => Promise<void> }) => { shortcuts.set(name, definition.handler); },
   } as unknown as ExtensionAPI;
   const ctx = { mode: "tui", sessionManager: { getSessionId: () => session }, ui } as unknown as ExtensionContext;
   return {
     api, commands, widgets,
+    shortcuts,
+    shortcut() { return shortcuts.get("ctrl+alt+t")?.(ctx); },
+    get customCalls() { return customCalls; },
     get viewer() { return viewer!; },
     open() { return commandHandler("", ctx); },
     get component() { return component; },
@@ -420,4 +426,129 @@ test("Escape during a stop or while awaiting its catalog prevents later UI trans
       assert.match(screen(x), /Inactive/); assert.match(screen(x), /#t /);
     } finally { r.close(); }
   }
+});
+
+const terminal = (id: string): PresentedTask => ({ ...active(id, "pwsh"), phase: "completed", actions: ["inspect", "delete"] });
+
+test("delete is advertised only with a terminal callback and recipient rejects active or mismatched identities", async () => {
+  const bus = new Bus(), x = fake(bus); let catalog!: { participantId: string; tasks: PresentedTask[] }; let calls = 0;
+  bus.on(TASKS_CHANNEL, raw => { const e = raw as typeof catalog & { type: string }; if (e.type === "catalog") catalog = e; });
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "ok", delete: async () => { calls++; return "deleted"; } } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", [active("a", "pwsh"), terminal("z")]);
+    assert.deepEqual(catalog.tasks.map(t => t.actions), [["inspect"], ["inspect", "delete"]]);
+    const request = { v: 1, type: "request", sessionId: "s", participantId: catalog.participantId, requesterId: "remote", taskKey: "z", taskId: "z", source: "pwsh", action: "delete" };
+    for (const patch of [{ taskKey: "a", taskId: "a" }, { taskId: "bad" }, { taskKey: "bad" }, { sessionId: "bad" }, { source: "python" }, { participantId: "bad" }]) bus.emit(TASKS_CONTROL_CHANNEL, { ...request, ...patch, requestId: JSON.stringify(patch) });
+    await settle(); assert.equal(calls, 0);
+    bus.emit(TASKS_CONTROL_CHANNEL, { ...request, requestId: "valid" }); await settle(); assert.equal(calls, 1);
+  } finally { r.close(); }
+});
+
+test("d deletes without confirmation, contextual hints exclude unsupported actions, and empty history stays open", async () => {
+  const bus = new Bus(), x = fake(bus); let calls = 0;
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "details", stop: async () => "stopped", delete: async () => { calls++; r.publishCatalog("s", [active("a", "pwsh")]); return "deleted"; } } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", [active("a", "pwsh"), terminal("z")]); void x.open();
+    assert.match(screen(x, 200), /k stop/); assert.doesNotMatch(screen(x, 200), /d delete|x clear/);
+    x.viewer.handleInput("d"); assert.equal(calls, 0);
+    x.viewer.handleInput("\r"); await settle(); assert.match(screen(x, 200), /k stop/);
+    x.viewer.handleInput("\x1b"); x.viewer.handleInput("\t");
+    assert.match(screen(x, 200), /d delete.*x clear listed/); assert.doesNotMatch(screen(x, 200), /k stop/);
+    assert.match(screen(x, 80), /d delete.*x clear listed.*Esc close/);
+    x.viewer.handleInput("\r"); await settle(); assert.match(screen(x, 200), /d delete/); assert.doesNotMatch(screen(x, 200), /k stop/);
+    x.viewer.handleInput("d"); assert.equal(calls, 1); await settle();
+    assert.match(screen(x), /No inactive tasks/); assert.doesNotMatch(screen(x), /d delete|k stop|x clear/);
+    bus.emit(TASKS_CHANNEL, { v: 1, type: "catalog", sessionId: "s", participantId: "legacy", source: "pwsh", observedAt: Date.now(), tasks: [{ ...terminal("old"), actions: undefined }] });
+    assert.doesNotMatch(screen(x, 200), /d delete|k stop|x clear/);
+    x.viewer.handleInput("d"); x.viewer.handleInput("x"); x.viewer.handleInput("y"); assert.equal(calls, 1);
+    x.viewer.handleInput("\r"); assert.doesNotMatch(screen(x, 200), /d delete|k stop|r inspect again/);
+  } finally { r.close(); }
+});
+
+test("bulk cleanup freezes listed identities, confirms scope, revalidates and preserves partial errors", async () => {
+  const x = fake(new Bus()); let tasks = [active("active", "pwsh"), terminal("a"), terminal("b"), terminal("c")]; const calls: string[] = [];
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "ok", delete: async id => {
+    calls.push(id); if (id === "b") throw new Error("access denied");
+    tasks = tasks.filter(t => t.taskId !== id); r.publishCatalog("s", tasks); return "deleted";
+  } } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", tasks); void x.open(); x.viewer.handleInput("x"); assert.equal(calls.length, 0); x.viewer.handleInput("\t");
+    for (const key of ["n", "\x1b"]) {
+      x.viewer.handleInput("x"); assert.match(screen(x), /Delete 3 listed inactive/); assert.match(screen(x), /Read-only and omitted tasks are kept/);
+      x.viewer.handleInput(key); x.viewer.handleInput("y"); assert.equal(calls.length, 0);
+    }
+    x.viewer.handleInput("x");
+    tasks = tasks.map(t => t.taskId === "c" ? { ...t, phase: "active" as const } : t); tasks.push(terminal("new")); r.publishCatalog("s", tasks);
+    x.viewer.handleInput("y"); await settle();
+    assert.deepEqual(calls, ["a", "b"]); assert.match(screen(x), /1\/3 deleted/); assert.match(screen(x), /access denied/); assert.match(screen(x), /#c: Task action is no longer available/);
+    r.publishCatalog("s", tasks); assert.match(screen(x), /access denied/);
+    assert.deepEqual(tasks.map(t => t.taskId), ["active", "b", "c", "new"]);
+  } finally { r.close(); }
+});
+
+test("bulk cleanup stops queuing after Escape or session teardown", async () => {
+  for (const teardown of [false, true]) {
+    const x = fake(new Bus()); let resolve!: (s: string) => void; const calls: string[] = [];
+    const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "ok", delete: id => { calls.push(id); return new Promise(r => { resolve = r; }); } } });
+    try {
+      await x.fire("session_start"); r.publishCatalog("s", [terminal("a"), terminal("b")]); void x.open(); x.viewer.handleInput("\t"); x.viewer.handleInput("x"); x.viewer.handleInput("y");
+      assert.deepEqual(calls, ["a"]);
+      if (teardown) await x.fire("session_shutdown"); else x.viewer.handleInput("\x1b");
+      resolve("deleted"); await settle(); assert.deepEqual(calls, ["a"]);
+      if (teardown) assert.equal(screen(x), ""); else assert.match(screen(x), /Inactive/);
+    } finally { r.close(); }
+  }
+});
+
+test("delete timeout retains unknown outcome after catalog removal and ignores forged replies", async () => {
+  const bus = new Bus(), x = fake(bus); let request!: Record<string, unknown>;
+  bus.on(TASKS_CONTROL_CHANNEL, raw => { const e = raw as Record<string, unknown>; if (e.type === "request") request = e; });
+  const r = registerTaskReporter(x.api, "python", { heartbeatMs: 0, controlTimeoutMs: 15 });
+  const publish = (tasks: PresentedTask[]) => bus.emit(TASKS_CHANNEL, { v: 1, type: "catalog", sessionId: "s", participantId: "remote", source: "pwsh", observedAt: Date.now(), tasks });
+  try {
+    await x.fire("session_start"); publish([terminal("a")]); void x.open(); x.viewer.handleInput("\t"); x.viewer.handleInput("d");
+    assert.equal(request.action, "delete"); bus.emit(TASKS_CONTROL_CHANNEL, { ...request, type: "reply", action: "stop", ok: true, output: "forged" });
+    publish([]); await new Promise(r => setTimeout(r, 30)); assert.match(screen(x), /outcome is unknown/);
+    publish([]); assert.match(screen(x), /outcome is unknown/);
+  } finally { r.close(); }
+});
+
+test("owner-only shortcut shares command opening and suppresses duplicate viewers across teardown", async () => {
+  const bus = new Bus(), a = fake(bus), b = fake(bus);
+  const r1 = registerTaskReporter(a.api, "pwsh", { heartbeatMs: 0 }), r2 = registerTaskReporter(b.api, "python", { heartbeatMs: 0 });
+  try {
+    await a.fire("session_start"); await b.fire("session_start"); assert.deepEqual([...a.shortcuts.keys()], ["ctrl+alt+t"]); assert.equal(b.shortcuts.size, 0);
+    const first = a.shortcut(); const viewer = a.viewer; assert.match(screen(a), /Active/);
+    await a.shortcut(); await a.open(); assert.equal(a.customCalls, 1); assert.equal(a.viewer, viewer);
+    await a.fire("session_shutdown"); await first; assert.equal(screen(a), ""); await a.shortcut(); assert.equal(a.customCalls, 1);
+    await a.fire("session_start"); const second = a.open(); assert.equal(a.customCalls, 2); assert.match(screen(a), /Active/);
+    a.viewer.handleInput("\x1b"); await second;
+    const third = a.shortcut(); assert.equal(a.customCalls, 3); a.viewer.handleInput("\x1b"); await third;
+  } finally { r1.close(); r2.close(); }
+});
+
+test("bulk deletion keeps omitted history and read-only tasks even as catalogs reveal more history", async () => {
+  const bus = new Bus(), x = fake(bus); const calls: string[] = [];
+  let tasks = [active("running", "pwsh"), ...Array.from({ length: 101 }, (_, i) => terminal(String(i).padStart(3, "0")))];
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "ok", delete: async id => {
+    calls.push(id); tasks = tasks.filter(t => t.taskId !== id); r.publishCatalog("s", tasks); return "deleted";
+  } } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", tasks);
+    bus.emit(TASKS_CHANNEL, { v: 1, type: "catalog", sessionId: "s", participantId: "legacy", source: "pwsh", observedAt: Date.now(), tasks: [{ ...terminal("legacy"), actions: undefined }] });
+    void x.open(); x.viewer.handleInput("\t"); assert.match(screen(x), /2 omitted · 100 listed/);
+    x.viewer.handleInput("x"); assert.match(screen(x), /Delete 99 listed inactive/);
+    x.viewer.handleInput("y"); await settle(); assert.equal(calls.length, 99);
+    assert.deepEqual(tasks.map(t => t.taskId), ["running", "099", "100"]);
+    assert.match(screen(x), /#legacy/); assert.match(screen(x), /#099/); assert.doesNotMatch(screen(x), /k stop/);
+  } finally { r.close(); }
+});
+
+test("successful delete replies do not optimistically hide unchanged catalog records", async () => {
+  const x = fake(new Bus());
+  const r = registerTaskReporter(x.api, "pwsh", { heartbeatMs: 0, controls: { inspect: async () => "ok", delete: async () => "deleted" } });
+  try {
+    await x.fire("session_start"); r.publishCatalog("s", [terminal("a")]); void x.open(); x.viewer.handleInput("\t"); x.viewer.handleInput("d"); await settle();
+    assert.match(screen(x), /Inactive/); assert.match(screen(x), /#a/);
+  } finally { r.close(); }
 });
