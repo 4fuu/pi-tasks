@@ -318,6 +318,7 @@ test("viewer defaults to active tasks, toggles history and clamps filtered selec
     r.publishCatalog("s", [active("a", "pwsh"), active("b", "pwsh"), done]);
     void x.open();
     assert.match(screen(x, 32), /Tasks · Active/); assert.match(screen(x, 32), /Tab active\/inactive/);
+    assert.match(screen(x, 80), /Esc close/);
     assert.doesNotMatch(screen(x), /#done/);
     x.viewer.handleInput("\x1b[F"); assert.match(screen(x), /> #b /);
     x.viewer.handleInput("\t"); assert.match(screen(x), /Tasks · Inactive/); assert.match(screen(x), /> #done /);

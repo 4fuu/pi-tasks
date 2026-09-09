@@ -189,7 +189,7 @@ export class TasksViewer implements Component {
       const start = Math.max(0, this.index - this.page + 1);
       body = tasks.slice(start, start + this.page).map((t, i) => `${start + i === this.index ? ">" : " "} #${plain(t.taskId).replace(/\n/g, " ")} · ${t.source} · ${plain(t.statusLabel).replace(/\n/g, " ")}${t.actions?.length ? ` [${t.actions.join("/")}]` : " [read-only]"}${t.summary || t.meta ? ` · ${plain(t.summary || t.meta || "").replace(/\n/g, " ")}` : ""}`);
       if (!body.length) body = [`No ${this.inactive ? "inactive" : "active"} tasks.`];
-      hint = "Tab active/inactive · ↑↓ select · PgUp/PgDn · Home/End · Enter inspect · k stop · r refresh · Esc close";
+      hint = "Tab active/inactive · ↑↓ select · Enter inspect · k stop · r refresh · Esc close";
     }
     return [this.theme.fg("accent", this.theme.bold(`Tasks · ${this.inactive ? "Inactive" : "Active"} · ${state.activeTotal} active`)), this.theme.fg("borderMuted", "─".repeat(width)), ...body, this.theme.fg("dim", `${state.omitted} omitted · ${tasks.length} listed`), this.theme.fg("dim", hint)].map(line => truncateToWidth(line, width));
   }
