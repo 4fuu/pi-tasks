@@ -1,15 +1,29 @@
 {
   "name": "@4fu/pi-tasks",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Shared task presentation runtime for Pi extensions",
   "license": "MIT",
   "author": "4fuu",
-  "repository": { "type": "git", "url": "git+https://github.com/4fuu/pi-tasks.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4fuu/pi-tasks.git"
+  },
   "type": "module",
-  "engines": { "node": ">=22.19.0" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
